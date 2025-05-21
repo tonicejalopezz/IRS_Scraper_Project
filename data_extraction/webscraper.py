@@ -1,129 +1,111 @@
-import sys
+# Modules Within This Project
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from config.db_connection import fetch_engine
 
+# Libraries
+import pandas as pd
 from bs4 import BeautifulSoup
 import requests
 import xmltodict
-
-import pandas as pd
-
 from dotenv import load_dotenv
-import os
 
-def fetch_table(engine, table_name, start_letter, end_letter):
-  """
-  Extracting data from PostgreSQL database using SQLAlchemy.
-  """
+class DatabaseHandler:
 
-  query = f"""
-  SELECT ein, name, asset_amt, income_amt, revenue_amt
-  FROM {table_name}
+  def __init__(self, engine):
+    self.engine = engine
 
-  WHERE UPPER(LEFT(name, 1)) BETWEEN UPPER('{start_letter}') AND UPPER('{end_letter}')
+  def fetch_table(self, table_name, start_letter, end_letter):
+    """
+    Extracting data from PostgreSQL database using SQLAlchemy with the intention to select
+    non exempt organizations within the letter range from the databse.
+    """
+    query = f"""
+    SELECT ein, name, asset_amt, income_amt, revenue_amt
+    FROM {table_name}
+    WHERE UPPER(LEFT(name, 1)) BETWEEN UPPER('{start_letter}') AND UPPER('{end_letter}')
+    ORDER BY NAME ASC;
+    """
+    try:
+      table = pd.read_sql(query, self.engine)
+      return table
+    except Exception as e:
+      print(f"Error Fetching Table {table_name} from PostgreSQL: {e}")
 
-  ORDER BY NAME ASC;
-  """
+class Form990Info:
 
-  try:
+  def __init__(self):
+    load_dotenv()
+    self.main_url = os.getenv("MAIN_URL")
+    self.search_url = os.getenv("ORG_URL")
 
-    table = pd.read_sql(query, engine)
-    return table
-  
-  except Exception as e:
-    print(f"Error fetching table {table_name}: {e}")
-    return None
-  
-def scrape_data(org_id):
-  """
-  Scraping data for each EIN from target URL.
-  """
-
-  load_dotenv()
-
-  search_url = os.getenv("ORG_URL")
-  main_url = os.getenv("MAIN_URL")
-
-  try:
-
-    page = requests.get(search_url + str(org_id))
-
-    soup = BeautifulSoup(page.text, "html.parser")
-
-    filings = soup.find_all("section", class_="right-content")
-    form990s = [filing for filing in filings if filing.find("h5") and filing.find("h5").text.strip() == "990"]
-
-    if len(form990s) >= 1:
-      
-      tag = form990s[0].find("a", href=True, string="XML")
-
-      if tag:
-        try: 
-
-          tag_response = requests.get(main_url + tag["href"])
-          tag_response.raise_for_status()
-
-          temp = xmltodict.parse(tag_response.content)
-
-          form_path = temp.get("Return", {}).get("ReturnData", {}).get("IRS990", {})
-          org_officer = form_path.get("PrincipalOfficerNm", None)
-          website = form_path.get("WebsiteAddressTxt", None)
-          description = form_path.get("ActivityOrMissionDesc", None)
-
-          return [org_officer, website, description]
-        
-        except requests.exceptions.RequestException as e:
-          print(f"Error fetching XML data for EIN {org_id}: {e}")
-          return [None, None, None]
-        
-      else:
-        print(f"Error parsing XML data for EIN {org_id}")
+  def scrape_data(self, org_id="ein", organization="name"):
+    """
+    Scraping data for each EIN specified if they contain an existing 990 form, 
+    providing principal officer name, website to then later scrape contacts, and 
+    description to later identify the area of focus for the nonprofit organization.
+    """
+    try:
+      page = requests.get(self.search_url + str(org_id))
+      page.raise_for_status()
+      soup = BeautifulSoup(page.text, "html.parser")
+      files = soup.find_all("section", class_="right-content")
+      form990 = [form for form in files if form.find("h5") and form.find("h5").text.strip() == "990"]
+      if not form990:
+        print(f"No form 990 Found For Organization: {organization}, EIN: {org_id}")
         return [None, None, None]
-        
-    else:
-      print(f"No 990 form found for EIN {org_id}")
+      
+      # Form 990s are XML documents
+      tag = form990[0].find("a", href=True, string="XML")
+      if not tag:
+        print(f"Error Parsing form 990 XML document for Organization:{organization}, EIN: {org_id}")
+        return [None, None, None]
+      
+      tag_response = requests.get(self.main_url + tag["href"])
+      tag_response.raise_for_status()
+
+      temp = xmltodict.parse(tag_response.content)
+      form_path = temp.get("Return", {}).get("ReturnData", {}).get("IRS990", {})
+      return [
+                form_path.get("PrincipalOfficerNm", None),
+                form_path.get("WebsiteAddressTxt", None),
+                form_path.get("ActivityOrMissionDesc", None)
+            ]
+
+    except requests.exceptions.RequestException as e:
+      print(f"Request Error for Organization Name: {organization}, EIN: {org_id} ----- {e}")
       return [None, None, None]
     
-  except requests.exceptions.RequestException as e:
-    print(f"Error fetching page for EIN {org_id}: {e}")
-    return [None, None, None]
-  
-def fetch_org_data(table, id_column="ein"):
 
-  officer_list = []
-  website_list = []
-  description_list = []
+class OrgPipeline:
 
-  for row in table.itertuples(index=False):
+  def __init__(self, engine, scraper):
+    self.db_handler = DatabaseHandler(engine)
+    self.scraper = scraper
 
-    ein = getattr(row, id_column)
+  def fetch_org_data(self, table, id_column="ein", organization="name"):
+    """
+    For each row in the requested table, contacts will be collected
+    if conditions are met.
+    """
+    officers, websites, descriptions = [], [], []
 
-    officer, website, description = scrape_data(ein)
+    for row in table.itertuples(index=False):
 
-    officer_list.append(officer)
-    website_list.append(website)
-    description_list.append(description)
+      ein = getattr(row, id_column)
+      name = getattr(row, organization)
 
-  table.loc[:, "Principal_Officer"] = officer_list
-  table.loc[:, "Website"] = website_list
-  table.loc[:, "Description"] = description_list
+      officer, website, description = self.scraper.scrape_data(ein, name)
+      officers.append(officer)
+      websites.append(website)
+      descriptions.append(description)
 
-  return table
+    table.loc[:, "principal_officer"] = officers
+    table.loc[:, "website"] = websites
+    table.loc[:, "description"] = descriptions
 
-def main():
+    return table
 
-  target_db = "ME_DB"
-  engine = fetch_engine(target_db)
-  table = fetch_table(engine, table_name="eo_me", start_letter="A", end_letter="K")
+  def run_extract(self, table_name, start_letter, end_letter, output_path):
 
-  test_table = table.iloc[0:50, :]
-  
-  test_table = fetch_org_data(test_table)
-
-  output = os.path.join("data/raw", "eo_me_org_scrape.csv")
-  test_table.to_csv(output, index=False)
-
-if __name__ == "__main__":
-  main()
-
+    req_table = self.db_handler.fetch_table(table_name, start_letter, end_letter)
+    ext_table = self.fetch_org_data(req_table)
+    ext_table.to_csv(output_path, index=False)
